@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hermes-chronos"
+version = "1.0.0"
+description = "Speculative Tree-Search Reasoning, Ephemeral Worktree Rollouts & Rewind Engine for Hermes Agent."
+readme = "README.md"
+authors = [{ name = "Nous Community", email = "community@nousresearch.com" }]
+license = { text = "MIT" }
+requires-python = ">=3.9"
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+]
+keywords = ["hermes-agent", "mcts", "speculative-execution", "reasoning", "git-worktree", "rollback"]
+
+[project.urls]
+Homepage = "https://github.com/NousResearch/hermes-chronos"
+Documentation = "https://github.com/NousResearch/hermes-chronos#readme"
+Repository = "https://github.com/NousResearch/hermes-chronos"
+
+[project.scripts]
+chronos = "chronos.cli:main"

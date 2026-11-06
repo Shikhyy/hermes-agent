@@ -1,0 +1,41 @@
+name: chronos
+version: "1.0.0"
+description: "Speculative Tree-Search Reasoning, Ephemeral Worktree Rollouts & Rewind Engine for Hermes Agent."
+author: "Nous Community"
+license: "MIT"
+homepage: "https://github.com/NousResearch/hermes-chronos"
+repository: "https://github.com/NousResearch/hermes-chronos"
+requires_hermes: ">=0.4.0"
+
+provides_tools:
+  - chronos_branch
+  - chronos_evaluate
+  - chronos_merge
+  - chronos_rewind
+  - chronos_status
+
+provides_hooks:
+  - pre_tool_call
+  - post_tool_call
+  - on_session_start
+  - on_session_end
+
+desktop_entry: "desktop/plugin.js"
+
+config_schema:
+  auto_speculate_on_error:
+    type: bool
+    default: true
+    description: "Automatically trigger speculative branch rollouts when a command or test fails."
+  max_branches:
+    type: int
+    default: 3
+    description: "Maximum number of parallel speculative branches to explore."
+  verifier_command:
+    type: str
+    default: "auto"
+    description: "Command used to verify branches (e.g. 'pytest', 'npm test', 'cargo test', or 'auto')."
+  timeout_seconds:
+    type: int
+    default: 60
+    description: "Maximum execution timeout per branch rollout."
