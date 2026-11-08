@@ -1,10 +1,10 @@
 name: chronos
 version: "1.0.0"
-description: "Speculative Tree-Search Reasoning, Ephemeral Worktree Rollouts & Rewind Engine for Hermes Agent."
-author: "Nous Community"
+description: "Speculative branching for Hermes Agent: try several candidate fixes in isolated git worktrees, verify each against the project's tests, and merge only a verified winner."
+author: "Shikhyy"
 license: "MIT"
-homepage: "https://github.com/NousResearch/hermes-chronos"
-repository: "https://github.com/NousResearch/hermes-chronos"
+homepage: "https://github.com/Shikhyy/hermes-agent/tree/main/plugins/chronos"
+repository: "https://github.com/Shikhyy/hermes-agent"
 requires_hermes: ">=0.4.0"
 
 provides_tools:
@@ -15,27 +15,19 @@ provides_tools:
   - chronos_status
 
 provides_hooks:
-  - pre_tool_call
-  - post_tool_call
   - on_session_start
-  - on_session_end
-
-desktop_entry: "desktop/plugin.js"
+  - on_session_finalize
 
 config_schema:
-  auto_speculate_on_error:
-    type: bool
-    default: true
-    description: "Automatically trigger speculative branch rollouts when a command or test fails."
   max_branches:
     type: int
     default: 3
-    description: "Maximum number of parallel speculative branches to explore."
+    description: "Maximum number of speculative branches explored per chronos_branch call (1-8)."
   verifier_command:
     type: str
     default: "auto"
-    description: "Command used to verify branches (e.g. 'pytest', 'npm test', 'cargo test', or 'auto')."
+    description: "Command used to verify branches, e.g. 'pytest -q' or 'npm test'. Parsed into an argv list and run through Hermes' terminal tool; the model cannot override it. 'auto' detects the project's test runner."
   timeout_seconds:
     type: int
     default: 60
-    description: "Maximum execution timeout per branch rollout."
+    description: "Maximum run time of the verification command per branch (1-600)."

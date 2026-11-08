@@ -1,81 +1,82 @@
 """
-Chronos Configuration: Settings loader and schema validator.
+Chronos Configuration.
+
+Settings come ONLY from the operator's Hermes ``config.yaml`` (the keys declared in this plugin's
+``config_schema``, read through ``ctx.get_config``). Nothing is read from the project being edited
+and there are no environment-variable overrides: a cloned repository must never be able to choose
+what command the host runs.
 """
 
 from __future__ import annotations
 
-import json
-import os
+import hashlib
+import shlex
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Callable, List, Optional
+
+PLUGIN_DATA_NAME = "chronos"
+
+_MAX_BRANCHES_CAP = 8
+_MAX_TIMEOUT_CAP = 600
+
+
+def _as_int(value: Any, default: int, lo: int, hi: int) -> int:
+    if isinstance(value, bool):
+        return default
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(lo, min(hi, number))
 
 
 @dataclass
 class ChronosConfig:
-    auto_speculate_on_error: bool = True
     max_branches: int = 3
     verifier_command: str = "auto"
     timeout_seconds: int = 60
-    storage_dir: Optional[Path] = None
 
     @classmethod
-    def load(cls, workspace_root: Path | str) -> ChronosConfig:
-        root = Path(workspace_root).resolve()
-        config_path = root / ".hermes" / "chronos" / "config.json"
+    def from_getter(cls, get: Optional[Callable[..., Any]]) -> ChronosConfig:
+        """Build from ``ctx.get_config``-style ``get(key, default)``; bad values fall back to defaults."""
+        if get is None:
+            return cls()
+        defaults = cls()
 
-        data: Dict[str, Any] = {}
-        if config_path.exists():
+        def read(key: str, default: Any) -> Any:
             try:
-                with open(config_path, "r", encoding="utf-8") as f:
-                    data = json.load(f)
+                return get(key, default)
             except Exception:
-                pass
+                return default
 
-        # Environment variable overrides
-        auto_spec = os.environ.get("CHRONOS_AUTO_SPECULATE")
-        if auto_spec is not None:
-            data["auto_speculate_on_error"] = auto_spec.lower() in ("true", "1", "yes")
-
-        max_b = os.environ.get("CHRONOS_MAX_BRANCHES")
-        if max_b is not None:
-            try:
-                data["max_branches"] = int(max_b)
-            except ValueError:
-                pass
-
-        cmd = os.environ.get("CHRONOS_VERIFIER_CMD")
-        if cmd is not None:
-            data["verifier_command"] = cmd
-
-        timeout = os.environ.get("CHRONOS_TIMEOUT")
-        if timeout is not None:
-            try:
-                data["timeout_seconds"] = int(timeout)
-            except ValueError:
-                pass
-
-        storage = data.get("storage_dir")
-        storage_path = Path(storage) if storage else None
-
+        command = read("verifier_command", defaults.verifier_command)
+        if not isinstance(command, str) or not command.strip():
+            command = defaults.verifier_command
         return cls(
-            auto_speculate_on_error=data.get("auto_speculate_on_error", True),
-            max_branches=data.get("max_branches", 3),
-            verifier_command=data.get("verifier_command", "auto"),
-            timeout_seconds=data.get("timeout_seconds", 60),
-            storage_dir=storage_path,
+            max_branches=_as_int(read("max_branches", defaults.max_branches), defaults.max_branches, 1, _MAX_BRANCHES_CAP),
+            verifier_command=command.strip(),
+            timeout_seconds=_as_int(
+                read("timeout_seconds", defaults.timeout_seconds), defaults.timeout_seconds, 1, _MAX_TIMEOUT_CAP
+            ),
         )
 
-    def save(self, workspace_root: Path | str) -> None:
-        root = Path(workspace_root).resolve()
-        config_path = root / ".hermes" / "chronos" / "config.json"
-        config_path.parent.mkdir(parents=True, exist_ok=True)
-        data = {
-            "auto_speculate_on_error": self.auto_speculate_on_error,
-            "max_branches": self.max_branches,
-            "verifier_command": self.verifier_command,
-            "timeout_seconds": self.timeout_seconds,
-            "storage_dir": str(self.storage_dir) if self.storage_dir else None,
-        }
-        with open(config_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
+    def verifier_argv(self) -> Optional[list[str]]:
+        """The operator-configured verifier as an argv list, or None for auto-detection."""
+        if self.verifier_command.lower() == "auto":
+            return None
+        argv = shlex.split(self.verifier_command)
+        return argv or None
+
+
+def project_key(workspace_root: Path | str) -> str:
+    """Stable short hash of a project's resolved path (names its plugin-data directory)."""
+    resolved = str(Path(workspace_root).resolve())
+    return hashlib.sha256(resolved.encode("utf-8")).hexdigest()[:16]
+
+
+def storage_root_for(workspace_root: Path | str) -> Path:
+    """``<HERMES_HOME>/plugin-data/chronos/<project-hash>/`` — never inside the project."""
+    from hermes_constants import get_hermes_home
+
+    return get_hermes_home() / "plugin-data" / PLUGIN_DATA_NAME / project_key(workspace_root)

@@ -1,5 +1,9 @@
 """
-Chronos Tools: Model-facing tool schemas and execution handlers for Hermes Agent.
+Chronos Tools: model-facing tool schemas and handlers.
+
+The workspace is resolved on EVERY call from the calling session's working directory (the plugin
+registers once per process but serves many sessions). The model cannot choose a verification
+command: that comes from the operator's config only.
 """
 
 from __future__ import annotations
@@ -7,25 +11,31 @@ from __future__ import annotations
 import json
 from typing import Any, Callable, Dict, Tuple
 
-from chronos.engine import ChronosEngine
+from chronos.manager import ChronosManager
 
 
-def get_tool_definitions(engine: ChronosEngine) -> Dict[str, Tuple[Dict[str, Any], Callable]]:
+def _error(exc: Exception) -> str:
+    return json.dumps({"error": str(exc)})
+
+
+def get_tool_definitions(manager: ChronosManager) -> dict[str, tuple[dict[str, Any], Callable]]:
     """Returns mapping of tool_name -> (schema, handler)."""
 
-    # 1. chronos_branch
     branch_schema = {
         "name": "chronos_branch",
         "description": (
-            "Spawns speculative solution branches in isolated git worktrees, applies candidate file "
-            "modifications, runs verification suites, and scores candidates without mutating the active workspace."
+            "Try several candidate fixes in isolated git worktrees outside the project: each hypothesis's "
+            "files are written into its own worktree, the project's test suite is run there, and the "
+            "candidates are scored. The active workspace is only changed if auto_merge_best is true and a "
+            "candidate passes verification. Use after a fix attempt fails, instead of piling edits onto a "
+            "broken tree. Requires a git repository with at least one commit."
         ),
         "parameters": {
             "type": "object",
             "properties": {
                 "hypotheses": {
                     "type": "array",
-                    "description": "List of candidate hypotheses to test in parallel isolated branches.",
+                    "description": "Candidate approaches to test in isolated worktrees.",
                     "items": {
                         "type": "object",
                         "properties": {
@@ -33,20 +43,19 @@ def get_tool_definitions(engine: ChronosEngine) -> Dict[str, Tuple[Dict[str, Any
                             "description": {"type": "string", "description": "Technical hypothesis explanation."},
                             "files": {
                                 "type": "object",
-                                "description": "Mapping of relative filepaths to proposed file contents.",
+                                "description": (
+                                    "Mapping of project-relative file paths to full proposed contents. "
+                                    "Absolute paths, '..' and .git paths are rejected."
+                                ),
                                 "additionalProperties": {"type": "string"},
                             },
                         },
                         "required": ["title", "files"],
                     },
                 },
-                "verifier_command": {
-                    "type": "string",
-                    "description": "Optional custom command to verify branches (e.g. 'pytest', 'npm test'). Defaults to auto-detection.",
-                },
                 "auto_merge_best": {
                     "type": "boolean",
-                    "description": "If true, automatically merges the highest-scoring passing branch into the active workspace.",
+                    "description": "If true, merge the highest-scoring passing candidate into the workspace.",
                     "default": True,
                 },
             },
@@ -54,42 +63,36 @@ def get_tool_definitions(engine: ChronosEngine) -> Dict[str, Tuple[Dict[str, Any
         },
     }
 
-    def handle_branch(args: Dict[str, Any], context: Any = None) -> str:
-        hypotheses = args.get("hypotheses", [])
-        verifier_cmd = args.get("verifier_command")
-        auto_merge = args.get("auto_merge_best", True)
-
+    def handle_branch(args: dict[str, Any], **kw: Any) -> str:
+        hypotheses = args.get("hypotheses") or []
         if not hypotheses:
             return json.dumps({"error": "No hypotheses provided for speculative branching."})
+        try:
+            engine = manager.engine_for_session(**kw)
+            return json.dumps(
+                engine.auto_rollout(hypotheses=hypotheses, auto_merge_best=bool(args.get("auto_merge_best", True))),
+                indent=2,
+            )
+        except Exception as exc:
+            return _error(exc)
 
-        result = engine.auto_rollout(
-            hypotheses=hypotheses,
-            verifier_command=verifier_cmd,
-            auto_merge_best=auto_merge,
-        )
-        return json.dumps(result, indent=2)
-
-    # 2. chronos_evaluate
     eval_schema = {
         "name": "chronos_evaluate",
-        "description": "Evaluates a specific speculative branch against the test suite and returns fitness metrics and diff.",
+        "description": "Re-run verification for one live speculative branch and return fitness metrics.",
         "parameters": {
             "type": "object",
-            "properties": {
-                "branch_id": {"type": "string", "description": "The node ID of the branch to evaluate."},
-                "verifier_command": {"type": "string", "description": "Optional test verification command override."},
-            },
+            "properties": {"branch_id": {"type": "string", "description": "Node ID of the branch to evaluate."}},
             "required": ["branch_id"],
         },
     }
 
-    def handle_evaluate(args: Dict[str, Any], context: Any = None) -> str:
+    def handle_evaluate(args: dict[str, Any], **kw: Any) -> str:
         branch_id = args.get("branch_id")
         if not branch_id:
             return json.dumps({"error": "branch_id is required."})
-
         try:
-            res = engine.evaluate_branch(branch_id, verifier_command=args.get("verifier_command"))
+            engine = manager.engine_for_session(**kw)
+            res = engine.evaluate_branch(branch_id)
             return json.dumps({
                 "branch_id": branch_id,
                 "passed": res.passed,
@@ -97,85 +100,76 @@ def get_tool_definitions(engine: ChronosEngine) -> Dict[str, Tuple[Dict[str, Any
                 "tests_passed": res.tests_passed,
                 "tests_failed": res.tests_failed,
                 "duration_ms": res.duration_ms,
-                "stdout": res.stdout[:500],
-                "stderr": res.stderr[:500],
+                "stdout": res.stdout[-500:],
+                "stderr": res.stderr[-500:],
             }, indent=2)
-        except Exception as e:
-            return json.dumps({"error": str(e)})
+        except Exception as exc:
+            return _error(exc)
 
-    # 3. chronos_merge
     merge_schema = {
         "name": "chronos_merge",
-        "description": "Merges a verified speculative branch into the active workspace and updates the DAG ledger.",
+        "description": (
+            "Merge a passed speculative branch that still has a live worktree into the workspace as a patch. "
+            "Refuses (changing nothing) if the branch has no live worktree, did not pass, or does not apply cleanly."
+        ),
         "parameters": {
             "type": "object",
-            "properties": {
-                "branch_id": {"type": "string", "description": "The node ID of the branch to merge."},
-            },
+            "properties": {"branch_id": {"type": "string", "description": "Node ID of the branch to merge."}},
             "required": ["branch_id"],
         },
     }
 
-    def handle_merge(args: Dict[str, Any], context: Any = None) -> str:
+    def handle_merge(args: dict[str, Any], **kw: Any) -> str:
         branch_id = args.get("branch_id")
         if not branch_id:
             return json.dumps({"error": "branch_id is required."})
-
         try:
-            success = engine.merge_branch(branch_id)
+            engine = manager.engine_for_session(**kw)
+            changed = engine.merge_branch(branch_id)
             return json.dumps({
-                "success": success,
+                "success": True,
+                "changes_applied": changed,
                 "merged_branch_id": branch_id,
                 "active_node_id": engine.dag.active_node_id,
-                "message": f"Branch [{branch_id}] successfully merged into active workspace.",
             })
-        except Exception as e:
-            return json.dumps({"error": str(e)})
+        except Exception as exc:
+            return _error(exc)
 
-    # 4. chronos_rewind
     rewind_schema = {
         "name": "chronos_rewind",
-        "description": "Instantly rewinds the workspace and DAG state back to any historical node checkpoint.",
+        "description": (
+            "Check out the git commit recorded at a historical checkpoint. Refuses if the workspace has "
+            "uncommitted changes."
+        ),
         "parameters": {
             "type": "object",
-            "properties": {
-                "target_node_id": {
-                    "type": "string",
-                    "description": "The node ID to rewind back to.",
-                },
-            },
+            "properties": {"target_node_id": {"type": "string", "description": "Node ID to rewind to."}},
             "required": ["target_node_id"],
         },
     }
 
-    def handle_rewind(args: Dict[str, Any], context: Any = None) -> str:
+    def handle_rewind(args: dict[str, Any], **kw: Any) -> str:
         target_id = args.get("target_node_id")
         if not target_id:
             return json.dumps({"error": "target_node_id is required."})
-
         try:
-            success = engine.rewind_to(target_id)
-            return json.dumps({
-                "success": success,
-                "rewound_to_node": target_id,
-                "active_node_id": engine.dag.active_node_id,
-                "message": f"Workspace successfully rewound to checkpoint [{target_id}].",
-            })
-        except Exception as e:
-            return json.dumps({"error": str(e)})
+            engine = manager.engine_for_session(**kw)
+            engine.rewind_to(target_id)
+            return json.dumps({"success": True, "rewound_to_node": target_id, "active_node_id": engine.dag.active_node_id})
+        except Exception as exc:
+            return _error(exc)
 
-    # 5. chronos_status
     status_schema = {
         "name": "chronos_status",
-        "description": "Returns the complete Chronos decision DAG, active checkpoint, and rollout tree visualization.",
-        "parameters": {
-            "type": "object",
-            "properties": {},
-        },
+        "description": "Return the Chronos decision DAG, the active checkpoint and the rollout tree for this project.",
+        "parameters": {"type": "object", "properties": {}},
     }
 
-    def handle_status(args: Dict[str, Any], context: Any = None) -> str:
-        return json.dumps(engine.get_status_summary(), indent=2)
+    def handle_status(args: dict[str, Any], **kw: Any) -> str:
+        try:
+            return json.dumps(manager.engine_for_session(**kw).get_status_summary(), indent=2)
+        except Exception as exc:
+            return _error(exc)
 
     return {
         "chronos_branch": (branch_schema, handle_branch),

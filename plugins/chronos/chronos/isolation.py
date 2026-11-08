@@ -1,178 +1,204 @@
 """
-Chronos Isolation Engine: Ephemeral Git Worktrees and Filesystem Sandboxes.
-Enables parallel speculative branch execution without polluting the main repository.
+Chronos Isolation: ephemeral detached git worktrees for speculative branches.
+
+Safety rules enforced here:
+  * The user's project must already be a git repository with a commit. Chronos never runs
+    ``git init`` / ``git add -A`` / ``git commit`` on a directory that is not one.
+  * Worktrees live under a storage directory outside the project
+    (``<HERMES_HOME>/plugin-data/chronos/<project-hash>/``).
+  * Chronos only ever deletes directories it created: each worktree gets a sibling marker file, and
+    the storage root carries its own marker. The storage root itself is never removed.
+  * Merging applies a verified patch with ``git apply``; if that is not possible it refuses. There is
+    no "copy the whole tree over the workspace" fallback.
 """
 
 from __future__ import annotations
 
-import os
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Iterable, List, Optional, Tuple
+
+STORAGE_MARKER = ".chronos-storage"
+WORKTREE_MARKER_SUFFIX = ".chronos-owned"
+_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+_GIT_TIMEOUT = 120
+
+
+class IsolationError(RuntimeError):
+    """The workspace cannot be isolated (not a git repo, no commit, worktree creation failed)."""
+
+
+class MergeError(RuntimeError):
+    """A branch could not be merged into the workspace; the workspace was left untouched."""
 
 
 @dataclass
 class IsolationSession:
     branch_id: str
     worktree_path: Path
-    is_git_worktree: bool
     base_commit: str
+    is_git_worktree: bool = True
+    # The candidate's patch, snapshotted BEFORE the verifier ran (so test by-products never leak into a merge).
+    patch: Optional[str] = None
 
 
 class WorkspaceIsolation:
-    """Manages isolated workspaces for speculative execution branches."""
+    """Manages isolated worktrees for speculative execution branches."""
 
-    def __init__(self, workspace_root: Path | str, base_storage_dir: Optional[Path | str] = None):
+    def __init__(self, workspace_root: Path | str, storage_dir: Path | str):
         self.workspace_root = Path(workspace_root).resolve()
-        if base_storage_dir:
-            self.storage_dir = Path(base_storage_dir).resolve()
-        else:
-            self.storage_dir = self.workspace_root / ".hermes" / "chronos" / "worktrees"
+        self.storage_dir = Path(storage_dir).resolve()
         self.storage_dir.mkdir(parents=True, exist_ok=True)
+        marker = self.storage_dir / STORAGE_MARKER
+        if not marker.exists():
+            marker.write_text("Directory managed by the Hermes chronos plugin.\n", encoding="utf-8")
 
-    def _run_git(self, args: List[str], cwd: Optional[Path] = None) -> Tuple[int, str, str]:
-        cmd_cwd = str(cwd or self.workspace_root)
-        proc = subprocess.run(
-            ["git"] + args,
-            cwd=cmd_cwd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
+    # -- git helpers -----------------------------------------------------------------------
+
+    def _run_git(
+        self, args: list[str], cwd: Optional[Path] = None, stdin: Optional[str] = None
+    ) -> tuple[int, str, str]:
+        try:
+            proc = subprocess.run(
+                ["git"] + args,
+                cwd=str(cwd or self.workspace_root),
+                input=stdin,
+                capture_output=True,
+                text=True,
+                timeout=_GIT_TIMEOUT,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return 1, "", str(exc)
         return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
 
     def is_git_repo(self) -> bool:
         code, out, _ = self._run_git(["rev-parse", "--is-inside-work-tree"])
         return code == 0 and out == "true"
 
-    def ensure_git_repo(self) -> None:
-        """Initializes a git repository if one does not exist."""
-        if not self.is_git_repo():
-            self._run_git(["init"])
-            self._run_git(["config", "user.name", "Hermes Agent"])
-            self._run_git(["config", "user.email", "agent@hermes.nousresearch.com"])
-            # Create an initial commit if repository is completely empty
-            code, out, _ = self._run_git(["rev-parse", "--verify", "HEAD"])
-            if code != 0:
-                self._run_git(["add", "-A"])
-                self._run_git(["commit", "-m", "chore: initial commit by hermes-chronos", "--allow-empty"])
+    def get_head_commit(self) -> Optional[str]:
+        """HEAD of the workspace, or None if it is not a repo / has no commits. Never mutates."""
+        code, out, _ = self._run_git(["rev-parse", "--verify", "HEAD"])
+        return out if code == 0 and out else None
 
-    def get_head_commit(self) -> str:
-        self.ensure_git_repo()
-        code, out, _ = self._run_git(["rev-parse", "HEAD"])
-        if code != 0:
-            return "HEAD"
-        return out
+    def is_workspace_clean(self) -> bool:
+        code, out, _ = self._run_git(["status", "--porcelain"])
+        return code == 0 and not out
+
+    def require_repo(self) -> str:
+        if not self.is_git_repo():
+            raise IsolationError(
+                f"{self.workspace_root} is not a git repository. Chronos will not initialise one; "
+                "run `git init` and make a commit yourself first."
+            )
+        head = self.get_head_commit()
+        if head is None:
+            raise IsolationError("The repository has no commits yet; make an initial commit first.")
+        return head
+
+    # -- ownership / deletion ----------------------------------------------------------------
+
+    def _owned_marker(self, path: Path) -> Path:
+        return path.parent / (path.name + WORKTREE_MARKER_SUFFIX)
+
+    def _is_owned_worktree(self, path: Path) -> bool:
+        try:
+            resolved = path.resolve()
+        except OSError:
+            return False
+        return (
+            resolved.parent == self.storage_dir
+            and (self.storage_dir / STORAGE_MARKER).is_file()
+            and self._owned_marker(resolved).is_file()
+        )
+
+    def _delete_owned(self, path: Path) -> None:
+        """rmtree a directory only if chronos created it (marker present and inside storage_dir)."""
+        if self._is_owned_worktree(path):
+            shutil.rmtree(path, ignore_errors=True)
+            self._owned_marker(path.resolve()).unlink(missing_ok=True)
+
+    # -- worktrees -------------------------------------------------------------------------
 
     def create_isolated_worktree(self, branch_id: str) -> IsolationSession:
-        """
-        Creates an isolated workspace for a speculative branch.
-        Uses `git worktree` when possible for speed and exact branch tracking;
-        falls back to copytree snapshotting if worktrees cannot be created.
-        """
+        """Create a detached worktree at the workspace's HEAD. Raises IsolationError, never falls back."""
+        if not _ID_RE.fullmatch(branch_id):
+            raise IsolationError(f"Invalid branch id {branch_id!r}.")
+        base_commit = self.require_repo()
+
         worktree_path = self.storage_dir / f"branch-{branch_id}"
-        branch_name = f"chronos-{branch_id}"
+        if worktree_path.exists() and not self._is_owned_worktree(worktree_path):
+            raise IsolationError(f"{worktree_path} already exists and was not created by chronos.")
+        self._delete_owned(worktree_path)
 
-        # Clean up any pre-existing directory
-        if worktree_path.exists():
-            shutil.rmtree(worktree_path, ignore_errors=True)
+        code, _, err = self._run_git(["worktree", "add", "--detach", str(worktree_path), base_commit])
+        if code != 0 or not worktree_path.exists():
+            raise IsolationError(f"git worktree add failed: {err or 'unknown error'}")
+        self._owned_marker(worktree_path).write_text("chronos worktree\n", encoding="utf-8")
+        self._exclude_build_artifacts(worktree_path)
+        return IsolationSession(branch_id=branch_id, worktree_path=worktree_path, base_commit=base_commit)
 
-        self.ensure_git_repo()
-        base_commit = self.get_head_commit()
-
-        # Try git worktree add
-        # First ensure no old branch exists with same name
-        self._run_git(["branch", "-D", branch_name])
-        code, out, err = self._run_git(
-            ["worktree", "add", "-b", branch_name, str(worktree_path), base_commit]
-        )
-
-        if code == 0 and worktree_path.exists():
-            return IsolationSession(
-                branch_id=branch_id,
-                worktree_path=worktree_path,
-                is_git_worktree=True,
-                base_commit=base_commit,
-            )
-
-        # Fallback: Filesystem directory snapshot
-        def ignore_patterns(path: str, names: List[str]):
-            ignored = {".git", ".hermes", "node_modules", "__pycache__", ".venv", "venv", ".pytest_cache"}
-            return [n for n in names if n in ignored]
-
-        shutil.copytree(self.workspace_root, worktree_path, ignore=ignore_patterns)
-        return IsolationSession(
-            branch_id=branch_id,
-            worktree_path=worktree_path,
-            is_git_worktree=False,
-            base_commit=base_commit,
-        )
+    def _exclude_build_artifacts(self, worktree_path: Path) -> None:
+        """Keep test/build by-products out of `git add -A` (this worktree only, via its info/exclude)."""
+        code, out, _ = self._run_git(["rev-parse", "--git-path", "info/exclude"], cwd=worktree_path)
+        if code != 0 or not out:
+            return
+        exclude = Path(out) if Path(out).is_absolute() else worktree_path / out
+        try:
+            exclude.parent.mkdir(parents=True, exist_ok=True)
+            with open(exclude, "a", encoding="utf-8") as fh:
+                fh.write("\n__pycache__/\n*.pyc\n.pytest_cache/\nnode_modules/\n")
+        except OSError:
+            pass
 
     def compute_diff(self, session: IsolationSession) -> str:
-        """Computes the unified diff between the isolated branch and base state."""
-        if session.is_git_worktree:
-            # Check diff against base commit
-            self._run_git(["add", "-A"], cwd=session.worktree_path)
-            code, out, _ = self._run_git(["diff", session.base_commit], cwd=session.worktree_path)
-            if code == 0:
-                return out
-        return ""
+        """Unified diff of the worktree against the commit it was created from."""
+        self._run_git(["add", "-A"], cwd=session.worktree_path)
+        code, out, _ = self._run_git(["diff", "--cached", "--binary", session.base_commit], cwd=session.worktree_path)
+        return out + "\n" if code == 0 and out else ""
 
     def apply_to_workspace(self, session: IsolationSession) -> bool:
         """
-        Merges the winning branch back to the main workspace.
-        """
-        diff = self.compute_diff(session)
-        if not diff:
-            # No changes or copy fallback: sync files
-            self._sync_directories(session.worktree_path, self.workspace_root)
-            return True
+        Apply the branch's patch to the workspace with ``git apply``.
 
-        # Apply diff via git apply with diff passed to stdin
-        proc = subprocess.run(
-            ["git", "apply", "--whitespace=nowarn"],
-            cwd=str(self.workspace_root),
-            input=diff,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-        if proc.returncode != 0:
-            # Fallback to file copy sync
-            self._sync_directories(session.worktree_path, self.workspace_root)
+        Returns False if the branch made no changes. Raises MergeError (workspace untouched) if the
+        patch does not apply cleanly; there is deliberately no file-copy fallback.
+        """
+        diff = session.patch if session.patch is not None else self.compute_diff(session)
+        if not diff:
+            return False
+        code, _, err = self._run_git(["apply", "--check", "--whitespace=nowarn"], stdin=diff)
+        if code != 0:
+            raise MergeError(f"Patch does not apply cleanly to the workspace; nothing was changed. {err}")
+        code, _, err = self._run_git(["apply", "--whitespace=nowarn"], stdin=diff)
+        if code != 0:
+            raise MergeError(f"git apply failed: {err}")
         return True
 
-    def _sync_directories(self, src: Path, dst: Path) -> None:
-        """Copies modified and new files from source to destination."""
-        ignored = {".git", ".hermes", "node_modules", "__pycache__", ".venv", "venv", ".pytest_cache"}
-        for root, dirs, files in os.walk(src):
-            dirs[:] = [d for d in dirs if d not in ignored]
-            rel_dir = Path(root).relative_to(src)
-            target_dir = dst / rel_dir
-            target_dir.mkdir(parents=True, exist_ok=True)
-            for file in files:
-                if file in ignored:
-                    continue
-                src_file = Path(root) / file
-                dst_file = target_dir / file
-                shutil.copy2(src_file, dst_file)
-
     def remove_worktree(self, session: IsolationSession) -> None:
-        """Safely removes an isolated worktree and deletes its temporary branch."""
-        branch_name = f"chronos-{session.branch_id}"
-        if session.is_git_worktree:
+        """Remove one worktree that chronos created."""
+        if self._is_owned_worktree(session.worktree_path):
             self._run_git(["worktree", "remove", "--force", str(session.worktree_path)])
-            self._run_git(["branch", "-D", branch_name])
+            self._delete_owned(session.worktree_path)
+        self._run_git(["worktree", "prune"])
 
-        if session.worktree_path.exists():
-            shutil.rmtree(session.worktree_path, ignore_errors=True)
-
-    def prune_all(self) -> None:
-        """Removes all stale worktrees in the storage directory."""
+    def prune_all(self, keep: Iterable[Path] = ()) -> int:
+        """
+        Remove stale worktrees chronos created (marker present), except the paths in ``keep``.
+        Anything else in the storage directory is left alone. Returns the number removed.
+        """
+        keep_set = {Path(p).resolve() for p in keep}
+        removed = 0
+        if self.storage_dir.is_dir() and (self.storage_dir / STORAGE_MARKER).is_file():
+            for child in sorted(self.storage_dir.iterdir()):
+                if not child.is_dir() or child.resolve() in keep_set or not self._is_owned_worktree(child):
+                    continue
+                self._run_git(["worktree", "remove", "--force", str(child)])
+                self._delete_owned(child)
+                removed += 1
         if self.is_git_repo():
             self._run_git(["worktree", "prune"])
-        if self.storage_dir.exists():
-            shutil.rmtree(self.storage_dir, ignore_errors=True)
-            self.storage_dir.mkdir(parents=True, exist_ok=True)
+        return removed

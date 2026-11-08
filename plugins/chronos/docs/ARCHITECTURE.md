@@ -1,79 +1,39 @@
-# Chronos Architecture Specification
+# Chronos Architecture
 
-> **Speculative Tree-Search Reasoning, Ephemeral Worktree Rollouts & Rewind Engine for Hermes Agent**
+## Flow
 
----
+1. The model calls `chronos_branch` with N hypotheses (title + `{relative path: full contents}`).
+2. All file maps are validated up front (no absolute paths, `..`, `.git`, symlink escapes).
+3. For each hypothesis a **detached git worktree** is created under
+   `<HERMES_HOME>/plugin-data/chronos/<project-hash>/worktrees/`, the files are written there, and the
+   resulting patch is snapshotted.
+4. The operator-configured (or auto-detected) verifier runs in the worktree through Hermes' `terminal`
+   tool; results are scored and recorded in the DAG.
+5. If requested, the best **passing** branch's snapshotted patch is applied to the workspace with
+   `git apply` (after `--check`); sibling worktrees are removed.
 
-## 1. Problem Statement
+## Modules
 
-Existing autonomous coding agents operate under a **linear single-trajectory execution model**:
-$$\tau = (s_0, a_0, s_1, a_1, \dots, s_T, a_T)$$
+| Module | Responsibility |
+| :--- | :--- |
+| `chronos/manager.py` | Resolves the calling session's working directory on every call; one engine per project. |
+| `chronos/engine.py` | Rollout, evaluation, merge, rewind; file-key validation. |
+| `chronos/isolation.py` | Worktree lifecycle, marker-gated deletion, patch snapshot/apply. Never runs `git init`. |
+| `chronos/verifier.py` | argv-only verification through a pluggable runner (Hermes `terminal` tool in production), scoring. |
+| `chronos/config.py` | Settings from `config.yaml` (`ctx.get_config`) only; storage path under `HERMES_HOME`. |
+| `chronos/dag.py` | The decision DAG (`dag.json` in the plugin-data directory). |
+| `chronos/tools.py`, `chronos/hooks.py`, `__init__.py` | Tool schemas/handlers, session hooks, `register(ctx)`. |
 
-When an agent encounters a regression, test failure, or environment error at step $t$, it is forced to execute corrective actions directly on top of the already mutated workspace state $s_t$. This induces compounding hallucinations, code pollution, and destructive git histories.
+## DAG
 
-**Chronos** replaces this linear model with a **Monte Carlo Tree Search (MCTS) Speculative Rollout Engine**, allowing Hermes Agent to hypothesize multiple candidate fixes in parallel isolated worktrees, evaluate them against deterministic verifiers, and commit only mathematically optimal solutions.
+Each node records `id`, `parent_id`, `status` (`pending|running|passed|failed|merged|reverted|pruned`),
+`diff`, `metrics`, and `commit_sha`. The root checkpoint is anchored to the commit the project was at
+when Chronos first saw it; `chronos_rewind` checks out a node's `commit_sha` and refuses on a dirty tree.
 
----
+## Invariants
 
-## 2. Core Architecture
-
-```
-                               ┌─── [Branch A: Hypothesis 1] ──▶ Verifier (Fail: 0.35) ──▶ Discarded
-                               │
-[State S_t: Test Failure] ─────┼─── [Branch B: Hypothesis 2] ──▶ Verifier (Fail: 0.40) ──▶ Discarded
-                               │
-                               └─── [Branch C: Hypothesis 3] ──▶ Verifier (Pass: 0.98) ──▶ AUTO-MERGED
-                                                                                               │
-                                                                                 [Hermes Desktop DAG]
-```
-
-### 2.1 Workspace Isolation Engine (`chronos.isolation`)
-Chronos leverages Git's native worktree subsystem (`git worktree add -b <branch> <path> <commit>`).
-* **Zero Host Pollution:** Worktrees share the main `.git` object store, allowing instantaneous hardlinked checkouts without duplicating repository storage or dependencies.
-* **Deterministic Isolation:** File modifications made inside `branch-<id>` are completely invisible to the host workspace until an explicit `chronos_merge` is issued.
-* **Fallback Directory Engine:** On systems without Git initialized, Chronos gracefully degrades to an atomic copy-on-write directory snapshotter with automatic exclusion of build artifacts (`node_modules`, `.venv`, `.git`).
-
-### 2.2 Multi-Factor Fitness Function (`chronos.verifier`)
-Rather than relying solely on boolean exit codes, Chronos scores each candidate branch using a continuous multi-factor fitness function $S \in [0.0, 1.0]$:
-
-$$S = w_{pass} \cdot P + w_{exit} \cdot E + w_{diff} \cdot D + w_{time} \cdot T$$
-
-Where:
-* **$P$ (Test Pass Ratio, $w_{pass} = 0.60$):** $\frac{\text{tests\_passed}}{\text{tests\_passed} + \text{tests\_failed}}$
-* **$E$ (Exit Code Success, $w_{exit} = 0.25$):** $1.0 \text{ if } \text{exit\_code} == 0 \text{ else } 0.0$
-* **$D$ (Diff Cleanliness, $w_{diff} = 0.10$):** Penalizes sprawling, uncontrolled edits in favor of surgical fixes:
-  $$D = \max\left(0.2, 1.0 - \frac{\max(0, \text{lines\_changed} - 50)}{500}\right)$$
-* **$T$ (Execution Efficiency, $w_{time} = 0.05$):** Incentivizes faster execution before timeouts.
-
-### 2.3 Directed Acyclic Graph (DAG) Ledger (`chronos.dag`)
-The state space is tracked as an append-only JSON DAG stored at `.hermes/chronos/dag.json`.
-Every node records:
-* `id`: Unique 8-character cryptographic token.
-* `parent_id`: Pointer to the antecedent checkpoint.
-* `status`: `PENDING` | `RUNNING` | `PASSED` | `FAILED` | `MERGED` | `REVERTED` | `PRUNED`.
-* `diff`: Unified patch showing exact file modifications.
-* `metrics`: Continuous score, test breakdown, and duration.
-* `commit_sha`: Git commit hash for deterministic time-travel rollbacks.
-
----
-
-## 3. Hermes Agent Integration
-
-Chronos adheres strictly to the official Hermes Agent Plugin Specification:
-
-| Surface | File | Description |
-| :--- | :--- | :--- |
-| **Manifest** | `plugin.yaml` | Declares tools, hooks, config schema, and desktop entry point. |
-| **Plugin Init** | `__init__.py` | Implements `register(ctx)` to register tools and subscribe to hooks. |
-| **Model Tools** | `chronos/tools.py` | Exposes `chronos_branch`, `chronos_evaluate`, `chronos_merge`, `chronos_rewind`, `chronos_status`. |
-| **Lifecycle Hooks** | `chronos/hooks.py` | Subscribes to `pre_tool_call`, `post_tool_call`, `on_session_start`, `on_session_end`. |
-| **Hermes Desktop UI** | `desktop/plugin.js` | Visualizes the live interactive DAG, score gauges, diff drawer, and 1-click rewind buttons. |
-| **Catalog Entry** | `plugin-catalog/chronos.yaml` | Prepared for upstream PR into `NousResearch/hermes-agent`. |
-
----
-
-## 4. Safety & Invariants
-
-1. **Workspace Preservation:** The user's active workspace is never mutated during speculative rollouts.
-2. **Clean Pruning:** Ephemeral worktrees and temporary branches are automatically pruned upon session termination or candidate merge.
-3. **Deterministic Rewind:** Any state can be rolled back without data loss using recorded git commits and unified patches.
+1. The workspace changes only through an explicit merge (`git apply`, checked first) or a rewind of a
+   clean tree. Uncommitted work is never overwritten.
+2. The model cannot choose the verification command, a storage path, or write outside a worktree.
+3. Chronos deletes only directories it created (marker files); it never `rmtree`s its storage root.
+4. A branch with no verifier, a failing verifier, or no live worktree is never merged.

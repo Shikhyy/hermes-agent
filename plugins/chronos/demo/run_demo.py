@@ -5,6 +5,7 @@ Demonstrates Speculative Tree-Search Reasoning, Multi-Branch Worktree Isolation,
 Automated Test Verification, Candidate Auto-Merging, and Deterministic Rewind.
 """
 
+import subprocess
 import sys
 import tempfile
 import time
@@ -13,7 +14,17 @@ from pathlib import Path
 # Add project root to sys.path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from chronos.config import ChronosConfig
 from chronos.engine import ChronosEngine
+
+VERIFIER = "python3 -m unittest test_auth.py"
+
+
+def git(cwd: Path, *args: str) -> None:
+    subprocess.run(
+        ["git", "-c", "user.name=demo", "-c", "user.email=demo@example.invalid", *args],
+        cwd=str(cwd), check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
 
 
 def print_step(title: str):
@@ -64,13 +75,23 @@ def main():
         )
         print("📁 Workspace files initialized: 'auth.py' and 'test_auth.py'")
 
-        # Initialize Chronos Engine
-        engine = ChronosEngine(workspace_root=workspace)
+        # Chronos only works inside an existing git repository, so the demo makes its own throwaway one.
+        git(workspace, "init", "-q")
+        git(workspace, "add", "-A")
+        git(workspace, "commit", "-q", "-m", "buggy baseline")
+
+        # Initialize Chronos Engine (state and worktrees live outside the project directory).
+        # The verifier command comes from configuration, never from the model.
+        engine = ChronosEngine(
+            workspace_root=workspace,
+            config=ChronosConfig(verifier_command=VERIFIER),
+            storage_root=Path(tmpdir) / "chronos-state",
+        )
         print(f"🌿 Initial Checkpoint Created: [{engine.dag.active_node_id}]")
 
         # Step 2: Show initial failing tests
         print_step("STEP 2: Running Baseline Test Suite (Fails on IndexErrors)")
-        eval_before = engine.verifier.verify_workspace(workspace, "python3 -m unittest test_auth.py")
+        eval_before = engine._verifier().verify_workspace(workspace)
         print(f"❌ Test Status: FAILED (Passed: {eval_before.tests_passed}, Failed: {eval_before.tests_failed})")
         print(f"   Fitness Score: {eval_before.score:.2f}")
 
@@ -122,11 +143,7 @@ def main():
         ]
 
         start_time = time.time()
-        rollout_result = engine.auto_rollout(
-            hypotheses=hypotheses,
-            verifier_command="python3 -m unittest test_auth.py",
-            auto_merge_best=True,
-        )
+        rollout_result = engine.auto_rollout(hypotheses=hypotheses, auto_merge_best=True)
         duration = time.time() - start_time
 
         print(f"⏱️  Explored {rollout_result['total_branches_explored']} candidate branches in {duration:.2f}s")
@@ -141,7 +158,7 @@ def main():
 
         # Step 5: Verify the winning branch in the actual workspace
         print_step("STEP 5: Verifying Workspace After Automatic Merge of Winning Branch")
-        eval_after = engine.verifier.verify_workspace(workspace, "python3 -m unittest test_auth.py")
+        eval_after = engine._verifier().verify_workspace(workspace)
         print(f"✅ Workspace Test Status: PASSED (Passed: {eval_after.tests_passed}, Failed: {eval_after.tests_failed})")
         print(f"   Fitness Score: {eval_after.score:.2f}")
         print("\n📄 Verified auth.py contents:")
@@ -150,6 +167,9 @@ def main():
         # Step 6: Instant Rewind Demo
         print_step("STEP 6: Deterministic Time-Warp Rewind Demonstration")
         root_id = engine.dag.root_id
+        # Rewind refuses to discard uncommitted work, so commit the merged fix first.
+        git(workspace, "add", "-A")
+        git(workspace, "commit", "-q", "-m", "apply verified fix")
         print(f"Rewinding workspace back to root checkpoint [{root_id}]...")
         engine.rewind_to(root_id)
         print("⏪ Rewind completed!")

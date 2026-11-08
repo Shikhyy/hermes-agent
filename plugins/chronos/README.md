@@ -1,142 +1,94 @@
-# ⏳ Chronos: Speculative Tree-Search Reasoning & Rewind Engine for Hermes Agent
+# Chronos: speculative branching for Hermes Agent
 
-[![Hermes Agent Plugin](https://img.shields.io/badge/Hermes_Agent-Plugin-blueviolet.svg)](https://nousresearch.com)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Tests Passing](https://img.shields.io/badge/Tests-14%2F14%20Passing-brightgreen.svg)]()
-[![Catalog Compatible](https://img.shields.io/badge/Catalog-Ready-success.svg)]()
 
-> **AlphaZero for Code:** Monte Carlo Tree Search (MCTS) Speculative Rollouts, Isolated Git Worktrees, Multi-Factor Verification & Instant Time-Travel Rewinds for [Nous Research Hermes Agent](https://nousresearch.com).
-
----
-
-## 🌪️ The Problem: The Linear Agent Trap
-
-Every existing coding agent operates strictly linearly:
-
-$$\tau = (s_0, a_0, s_1, a_1, \dots, s_T, a_T)$$
-
-When an agent breaks code, it makes subsequent edits on top of broken code. This compounds hallucinations, creates sprawling messy diffs, and pollutes your git history. 
-
-Humans do not write code this way. We formulate hypotheses, test them in isolated branches or sandbox environments, discard bad ideas, and commit only verified solutions.
-
----
-
-## ⚡ The Solution: Chronos
-
-**Chronos** upgrades Hermes Agent from a linear single-path executor into a **Tree-Search Reasoning & Speculative Execution Engine**.
+When a fix attempt fails, an agent usually keeps editing the same broken tree. Chronos lets Hermes
+instead try **several candidate fixes in isolated git worktrees**, run the project's tests in each,
+score them, and merge only a candidate that passes.
 
 ```
-                               ┌─── [Branch A: Hypothesis 1] ──▶ Verifier (Fail: 0.35) ──▶ Discarded 🗑️
-                               │
-[State S_t: Test Failure] ─────┼─── [Branch B: Hypothesis 2] ──▶ Verifier (Fail: 0.15) ──▶ Discarded 🗑️
-                               │
-                               └─── [Branch C: Hypothesis 3] ──▶ Verifier (Pass: 1.00) ──▶ AUTO-MERGED 🌿
-                                                                                               │
-                                                                                 [Hermes Desktop DAG]
+                  ┌─ hypothesis A ─▶ worktree ─▶ tests ─▶ fail  (score 0.35) ─▶ discarded
+[failing project] ┼─ hypothesis B ─▶ worktree ─▶ tests ─▶ fail  (score 0.15) ─▶ discarded
+                  └─ hypothesis C ─▶ worktree ─▶ tests ─▶ pass  (score 1.00) ─▶ patch merged
 ```
 
-### Key Capabilities
-1. **Parallel Isolated Worktrees (`chronos.isolation`):** Spawns ephemeral candidate branches in isolated Git worktrees. Commands and file mutations execute in zero-copy sandboxes without touching your host workspace.
-2. **Multi-Factor Fitness Scoring (`chronos.verifier`):** Scores candidates continuously across test pass ratios ($60\%$), exit code success ($25\%$), surgical diff cleanliness ($10\%$), and execution efficiency ($5\%$).
-3. **Automatic Pruning & Merging (`chronos.engine`):** Automatically selects and merges the highest-scoring verified candidate into your working directory, while cleanly pruning dead branches.
-4. **Hermes Desktop DAG Explorer (`desktop/plugin.js`):** Interactive visual decision tree rendered natively in Hermes Desktop with syntax-highlighted diff viewers and node inspection.
-5. **Deterministic Time-Travel Rewind:** Rewinds repository state, working tree, and agent cognition back to any historical node in milliseconds.
+## Tools
 
----
-
-## 📦 Installation
-
-### From the Hermes Plugin Catalog
-```bash
-hermes plugins install chronos
-```
-
-### Local Development Installation
-Clone this repository into your local Hermes plugins directory:
-```bash
-git clone https://github.com/NousResearch/hermes-chronos ~/.hermes/plugins/chronos
-hermes plugins enable chronos
-```
-
-To validate the plugin against the official catalog suite:
-```bash
-hermes plugins validate ~/.hermes/plugins/chronos --install-deps
-```
-
----
-
-## 🛠️ Model-Callable Tools
-
-Chronos registers 5 tools directly with Hermes Agent:
-
-| Tool | Description |
+| Tool | What it does |
 | :--- | :--- |
-| `chronos_branch` | Spawns $1-3$ speculative candidate branches in isolated worktrees, applies candidate file modifications, runs the project test suite, and scores candidates without mutating the active workspace. |
-| `chronos_evaluate` | Runs test verification in a specific branch worktree and returns fitness metrics and diffs. |
-| `chronos_merge` | Merges a verified candidate branch into the active workspace and updates the DAG ledger. |
-| `chronos_rewind` | Instantly rolls back the workspace and decision DAG to any historical checkpoint. |
-| `chronos_status` | Returns the complete decision DAG, active checkpoint, and rollout tree visualization. |
+| `chronos_branch` | Writes each hypothesis's files into its own worktree, runs verification there, scores the results, and (optionally) merges the best passing one. |
+| `chronos_evaluate` | Re-runs verification for one live branch. |
+| `chronos_merge` | Applies a **passed** branch that still has a live worktree to the workspace as a patch. |
+| `chronos_rewind` | Checks out the git commit recorded at a checkpoint (refuses if the workspace has uncommitted changes). |
+| `chronos_status` | Shows the decision tree for the current project. |
 
----
+Hooks: `on_session_start` (prune stale chronos worktrees, record a baseline checkpoint) and
+`on_session_finalize` (remove this process's worktrees). There are no tool-call hooks.
 
-## 🪝 Lifecycle Hooks
+## Safety model
 
-Chronos subscribes to the Hermes Agent lifecycle to ensure continuous safety:
-* **`pre_tool_call`:** Records clean checkpoints before mutating tool calls (file writes, shell modifications).
-* **`post_tool_call`:** Detects test failures, tracebacks, or non-zero exit codes. Proactively advises Hermes to explore isolated candidate branches rather than making destructive host edits.
-* **`on_session_start`:** Initializes repository DAG, verifies git invariants, and cleans up stale worktrees.
-* **`on_session_end`:** Persists the execution DAG and flushes all ephemeral sandboxes.
+* **The model never chooses what runs.** There is no `verifier_command` tool argument. Verification
+  uses the operator's `verifier_command` setting (or an auto-detected default), split into an argv
+  list and run through **Hermes' `terminal` tool**, so the configured terminal backend and approval
+  policy apply. The model only supplies candidate *file contents*.
+* **Settings come from `config.yaml` only** (the keys declared in `plugin.yaml`'s `config_schema`,
+  under `plugins.entries.chronos.settings`). Nothing is read from the project being edited, and there
+  are no environment-variable overrides, so a cloned repo cannot pick a command or a storage path.
+* **File keys are validated.** Absolute paths, drive letters, `..` segments, anything under `.git`,
+  and paths that resolve outside the worktree (including through symlinks) are rejected before any
+  file is written.
+* **State lives outside the project:** `<HERMES_HOME>/plugin-data/chronos/<project-hash>/`
+  (worktrees and `dag.json`). Chronos only deletes directories it created, identified by marker
+  files; the storage root itself is never removed.
+* **Merges are patches, never copies.** A merge runs `git apply --check` first and refuses, leaving
+  the workspace untouched, if there is no live worktree, the branch did not pass, or the patch does
+  not apply cleanly. Uncommitted work is never overwritten.
+* **Git is required, and never initialised for you.** Chronos works only in an existing repository
+  that has at least one commit.
+* **The workspace is resolved per call** from the calling session's working directory.
 
----
+Limits: verification runs in worktrees on the Hermes host, so use a terminal backend that can see
+local paths (the default local backend does). If no test runner can be detected and
+`verifier_command` is `auto`, branches fail verification rather than passing by default.
 
-## 🖥️ Hermes Desktop UI Integration
+## Configuration
 
-Chronos includes a native extension for **Hermes Desktop** (`desktop/plugin.js`):
-* **Live Decision DAG Canvas:** Real-time visual node graph showing active branches, pass/fail status, and topological parent-child relationships.
-* **Syntax-Highlighted Diff Drawer:** Click any node to inspect the exact additions and deletions made in that candidate branch.
-* **1-Click Rewind Button:** One-touch rollback to any historical point in the session.
-
----
-
-## 🚀 Running the Interactive Demo
-
-Experience Chronos in action on a real buggy authentication service:
-```bash
-python3 demo/run_demo.py
+```yaml
+# ~/.hermes/config.yaml
+plugins:
+  entries:
+    chronos:
+      settings:
+        max_branches: 3            # 1-8 candidates per chronos_branch call
+        verifier_command: "pytest -q"   # or "auto" to detect pytest / unittest / npm / cargo / go
+        timeout_seconds: 60        # per-branch verification limit (1-600)
 ```
 
-### Output Preview:
-```text
-=== Chronos Decision DAG ===
-└── [f00dc3af] ✅ (main) Initial Checkpoint [score: 0.00]
-    ├── [c36e4348] 🗑️ (spec-1) Hypothesis A: Catch Exception & return None [score: 0.35]
-    ├── [22607f2b] 🗑️ (spec-2) Hypothesis B: Strict Regex Parser [score: 0.15]
-    └── [9585d4ef] 🌿 (spec-3) Hypothesis C: Defensive bounds checking [score: 1.00] ◀ [ACTIVE]
-```
-
----
-
-## 🧪 Running the Test Suite
+## Install
 
 ```bash
+hermes plugins install chronos      # once it is in the catalog
+```
+
+or, for local development, copy `plugins/chronos/` from
+[Shikhyy/hermes-agent](https://github.com/Shikhyy/hermes-agent) into `~/.hermes/plugins/chronos`
+and run `hermes plugins enable chronos`.
+
+## Demo and tests
+
+```bash
+python3 demo/run_demo.py        # builds a throwaway git repo and runs a rollout end to end
 python3 -m unittest discover -s tests -p 'test_*.py'
 ```
 
----
+The tests import `hermes_constants`; run them from a hermes-agent checkout (or put it on
+`PYTHONPATH`).
 
-## 🏆 Hackathon Catalog Submission
+## Scoring
 
-To submit Chronos to the official Hermes catalog:
-1. Copy `plugin-catalog/chronos.yaml` into your fork of `NousResearch/hermes-agent`:
-   ```bash
-   cp plugin-catalog/chronos.yaml <hermes-agent-fork>/plugin-catalog/chronos.yaml
-   ```
-2. Open a Pull Request against `NousResearch/hermes-agent`.
-3. Submit demo video on X tagging `@NousResearch`.
-4. Complete the official Typeform: `http://form.typeform.com/to/FwJLvOln`.
+`S = 0.60·tests_passed_ratio + 0.25·exit_code_ok + 0.10·small_diff + 0.05·speed`, in `[0, 1]`.
+Only a branch whose verification command exits 0 is eligible to merge.
 
----
+## License
 
-## 📄 License
-
-MIT © Nous Research Community
+MIT © Shikhyy

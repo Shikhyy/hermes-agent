@@ -34,7 +34,7 @@ class NodeMetrics:
     lines_added: int = 0
     lines_removed: int = 0
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
 
@@ -51,16 +51,16 @@ class DAGNode:
     diff: Optional[str] = None
     metrics: NodeMetrics = field(default_factory=NodeMetrics)
     error_message: Optional[str] = None
-    children: List[str] = field(default_factory=list)
+    children: list[str] = field(default_factory=list)
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
         data["status"] = self.status.value
         data["metrics"] = self.metrics.to_dict()
         return data
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> DAGNode:
+    def from_dict(cls, data: dict[str, Any]) -> DAGNode:
         metrics_data = data.get("metrics", {})
         metrics = NodeMetrics(**metrics_data) if isinstance(metrics_data, dict) else NodeMetrics()
         return cls(
@@ -83,7 +83,7 @@ class ChronosDAG:
     """Manages the full execution graph for Hermes Agent."""
 
     def __init__(self, root_id: Optional[str] = None):
-        self.nodes: Dict[str, DAGNode] = {}
+        self.nodes: dict[str, DAGNode] = {}
         self.active_node_id: Optional[str] = None
 
         if root_id is None:
@@ -170,9 +170,9 @@ class ChronosDAG:
     def get_active(self) -> DAGNode:
         return self.nodes[self.active_node_id or self.root_id]
 
-    def get_ancestors(self, node_id: str) -> List[DAGNode]:
+    def get_ancestors(self, node_id: str) -> list[DAGNode]:
         """Returns ordered list of ancestors from root down to node_id."""
-        path: List[DAGNode] = []
+        path: list[DAGNode] = []
         curr = self.nodes.get(node_id)
         while curr is not None:
             path.append(curr)
@@ -180,14 +180,14 @@ class ChronosDAG:
         path.reverse()
         return path
 
-    def get_sibling_branches(self, parent_id: str) -> List[DAGNode]:
+    def get_sibling_branches(self, parent_id: str) -> list[DAGNode]:
         """Returns all children of a given parent node."""
         parent = self.nodes.get(parent_id)
         if not parent:
             return []
         return [self.nodes[child_id] for child_id in parent.children if child_id in self.nodes]
 
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "root_id": self.root_id,
             "active_node_id": self.active_node_id,
@@ -195,7 +195,7 @@ class ChronosDAG:
         }
 
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> ChronosDAG:
+    def from_dict(cls, data: dict[str, Any]) -> ChronosDAG:
         dag = cls(root_id=data.get("root_id"))
         dag.active_node_id = data.get("active_node_id")
         nodes_data = data.get("nodes", {})
@@ -219,7 +219,7 @@ class ChronosDAG:
 
     def render_ascii_tree(self) -> str:
         """Renders an ASCII tree of the decision DAG."""
-        lines: List[str] = ["=== Chronos Decision DAG ==="]
+        lines: list[str] = ["=== Chronos Decision DAG ==="]
 
         def _traverse(node_id: str, prefix: str = "", is_last: bool = True):
             node = self.nodes.get(node_id)
