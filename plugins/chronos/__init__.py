@@ -7,18 +7,11 @@ directory here: each tool call resolves the calling session's working directory 
 
 from __future__ import annotations
 
-import sys
-from pathlib import Path
 from typing import Any
 
-# The plugin is a package with a nested ``chronos`` module; make it importable under any loader.
-_plugin_dir = str(Path(__file__).resolve().parent)
-if _plugin_dir not in sys.path:
-    sys.path.insert(0, _plugin_dir)
-
-from chronos.hooks import ChronosHooks
-from chronos.manager import ChronosManager
-from chronos.tools import get_tool_definitions
+from .chronos.hooks import ChronosHooks
+from .chronos.manager import ChronosManager
+from .chronos.tools import get_tool_definitions
 
 
 def register(ctx: Any) -> None:

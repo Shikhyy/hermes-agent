@@ -8,9 +8,32 @@ from pathlib import Path
 from _util import CALC_FILES, git, make_repo
 from chronos.config import ChronosConfig
 from chronos.engine import ChronosEngine, validate_file_map
+from chronos.hermes_io import FileIOError
 from chronos.isolation import MergeError
 
 VERIFIER = "python3 -m unittest test_calc.py"
+
+
+class FakeIO:
+    """Stand-in for Hermes' read_file/write_file. Records every call; `deny` simulates the core write guard."""
+
+    def __init__(self, deny=()):
+        self.deny = set(deny)
+        self.calls = []
+
+    def prepare(self, path):
+        self.calls.append(("read", Path(path)))
+
+    def write(self, path, content):
+        path = Path(path)
+        self.calls.append(("write", path))
+        if path.name in self.deny:
+            raise FileIOError(f"write_file refused {path}: protected path")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content.encode("utf-8"))
+
+    def writes(self):
+        return [p for kind, p in self.calls if kind == "write"]
 
 
 class TestValidateFileMap(unittest.TestCase):
@@ -43,6 +66,7 @@ class EngineCase(unittest.TestCase):
             self.workspace,
             config=ChronosConfig(verifier_command=VERIFIER),
             storage_root=self.base / "state",
+            file_io=FakeIO(),
         )
 
     def tearDown(self):
@@ -136,6 +160,82 @@ class TestMergeSafety(EngineCase):
         self.engine.evaluate_branch(node.id)
         with self.assertRaises(MergeError):
             self.engine.merge_branch(node.id)
+
+
+class TestMergeGuard(EngineCase):
+    """A merge writes only model-supplied files, only through Hermes' file tools, and is all-or-nothing."""
+
+    def _passing_branch(self, files):
+        node, _ = self.engine.spawn_branch("b")
+        self.engine.apply_modifications_to_branch(node.id, files)
+        self.assertTrue(self.engine.evaluate_branch(node.id).passed)
+        return node
+
+    FIX = "def add(a, b): return a + b\n"
+
+    def test_every_write_goes_through_the_file_tools_with_absolute_workspace_paths(self):
+        node = self._passing_branch({"calc.py": self.FIX})
+        self.engine.merge_branch(node.id)
+        io = self.engine.file_io
+        self.assertEqual(io.calls, [("read", self.workspace.resolve() / "calc.py"), ("write", self.workspace.resolve() / "calc.py")])
+        self.assertIn("a + b", (self.workspace / "calc.py").read_text())
+
+    def test_new_files_are_written_without_a_read(self):
+        node = self._passing_branch({"calc.py": self.FIX, "extra/new.py": "x = 1\n"})
+        self.engine.merge_branch(node.id)
+        kinds = [(kind, p.name) for kind, p in self.engine.file_io.calls]
+        self.assertIn(("write", "new.py"), kinds)
+        self.assertNotIn(("read", "new.py"), kinds)
+
+    def test_verifier_byproducts_in_the_worktree_are_never_written(self):
+        node = self._passing_branch({"calc.py": self.FIX})
+        session = self.engine.active_sessions[node.id]
+        (session.worktree_path / "junk.log").write_text("by-product\n")
+        (session.worktree_path / "test_calc.py").write_text("# tampered by a test run\n")
+        self.engine.merge_branch(node.id)
+        self.assertEqual([p.name for p in self.engine.file_io.writes()], ["calc.py"])
+        self.assertFalse((self.workspace / "junk.log").exists())
+        self.assertIn("unittest", (self.workspace / "test_calc.py").read_text())
+
+    def test_a_guard_refusal_aborts_the_merge_and_restores_earlier_writes(self):
+        node = self._passing_branch({"calc.py": self.FIX, "new_a.py": "a = 1\n", ".env": "SECRET=1\n"})
+        self.engine.file_io = FakeIO(deny={".env"})
+        before = (self.workspace / "calc.py").read_text()
+
+        with self.assertRaises(MergeError) as ctx:
+            self.engine.merge_branch(node.id)
+
+        self.assertIn("protected path", str(ctx.exception))
+        self.assertEqual((self.workspace / "calc.py").read_text(), before)  # overwritten file restored
+        self.assertFalse((self.workspace / "new_a.py").exists())  # newly created file removed
+        self.assertFalse((self.workspace / ".env").exists())
+        self.assertEqual(self.engine.dag.nodes[node.id].status.value, "passed")  # not recorded as merged
+        self.assertIn(node.id, self.engine.active_sessions)
+
+    def test_merge_is_refused_when_no_file_tool_is_available(self):
+        node = self._passing_branch({"calc.py": self.FIX})
+        self.engine.file_io = None
+        before = (self.workspace / "calc.py").read_text()
+        with self.assertRaises(MergeError):
+            self.engine.merge_branch(node.id)
+        self.assertEqual((self.workspace / "calc.py").read_text(), before)
+
+    def test_auto_rollout_reports_the_refusal_instead_of_merging(self):
+        self.engine.file_io = FakeIO(deny={"calc.py"})
+        summary = self.engine.auto_rollout([{"title": "fix", "files": {"calc.py": self.FIX}}])
+        self.assertFalse(summary["auto_merged"])
+        self.assertIn("protected path", summary["merge_error"])
+        self.assertIn("a - b", (self.workspace / "calc.py").read_text())
+
+
+class TestSessionScopedCleanup(EngineCase):
+    def test_cleanup_removes_only_the_owners_worktrees(self):
+        _, sa = self.engine.spawn_branch("a", owner="s1")
+        b, sb = self.engine.spawn_branch("b", owner="s2")
+        self.engine.cleanup_sessions(owner="s1")
+        self.assertFalse(sa.worktree_path.exists())
+        self.assertTrue(sb.worktree_path.exists())
+        self.assertEqual(list(self.engine.active_sessions), [b.id])
 
 
 class TestRewind(EngineCase):

@@ -10,10 +10,11 @@ from __future__ import annotations
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any, Dict, List, Optional, Tuple
 
-from chronos.config import ChronosConfig, storage_root_for
-from chronos.dag import ChronosDAG, DAGNode, NodeStatus
-from chronos.isolation import IsolationError, IsolationSession, MergeError, WorkspaceIsolation
-from chronos.verifier import BranchVerifier, Runner, VerificationResult
+from .config import ChronosConfig, storage_root_for
+from .dag import ChronosDAG, DAGNode, NodeStatus
+from .hermes_io import FileIOError, HermesFileIO
+from .isolation import IsolationError, IsolationSession, MergeError, WorkspaceIsolation
+from .verifier import BranchVerifier, Runner, VerificationResult
 
 MAX_FILES_PER_BRANCH = 200
 MAX_FILE_BYTES = 2_000_000
@@ -65,10 +66,13 @@ class ChronosEngine:
         config: Optional[ChronosConfig] = None,
         runner: Optional[Runner] = None,
         storage_root: Optional[Path | str] = None,
+        file_io: Optional[HermesFileIO] = None,
     ):
         self.workspace_root = Path(workspace_root).resolve()
         self.config = config or ChronosConfig()
         self.runner = runner
+        # How merges write the workspace: Hermes' read_file/write_file tools. None => merges are refused.
+        self.file_io = file_io
         self.storage_root = Path(storage_root) if storage_root else storage_root_for(self.workspace_root)
         self.isolation = WorkspaceIsolation(self.workspace_root, self.storage_root / "worktrees")
 
@@ -117,7 +121,7 @@ class ChronosEngine:
         self._save_dag()
         return node
 
-    def spawn_branch(self, title: str, description: str = "") -> tuple[DAGNode, IsolationSession]:
+    def spawn_branch(self, title: str, description: str = "", owner: str = "") -> tuple[DAGNode, IsolationSession]:
         """Create a speculative branch and its isolated worktree (raises IsolationError)."""
         self.isolation.require_repo()
         parent_id = self.dag.active_node_id or self.dag.root_id
@@ -134,6 +138,7 @@ class ChronosEngine:
             self.dag.update_node(node_id=node.id, status=NodeStatus.FAILED, error_message=str(exc))
             self._save_dag()
             raise
+        session.owner = owner
         self.active_sessions[node.id] = session
         self._save_dag()
         return node, session
@@ -162,6 +167,7 @@ class ChronosEngine:
         for target, content in targets:
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(content, encoding="utf-8")
+        session.files.update(clean)  # the exact set a later merge will write
 
     # -- evaluation ------------------------------------------------------------------------
 
@@ -171,8 +177,7 @@ class ChronosEngine:
         if not session:
             raise ValueError(f"No active session for node '{node_id}'.")
 
-        diff = self.isolation.compute_diff(session)
-        session.patch = diff  # what a merge will apply: the candidate's changes, not the verifier's by-products
+        diff = self.isolation.compute_diff(session)  # display/metrics only; a merge uses session.files
         lines_added = diff.count("\n+") - diff.count("\n+++")
         lines_removed = diff.count("\n-") - diff.count("\n---")
 
@@ -189,7 +194,9 @@ class ChronosEngine:
         self._save_dag()
         return result
 
-    def auto_rollout(self, hypotheses: list[dict[str, Any]], auto_merge_best: bool = True) -> dict[str, Any]:
+    def auto_rollout(
+        self, hypotheses: list[dict[str, Any]], auto_merge_best: bool = True, owner: str = ""
+    ) -> dict[str, Any]:
         """
         Explore candidate hypotheses in isolated worktrees, score them, optionally merge the best.
         Hypothesis format: {"title": str, "description": str, "files": {relative_path: content}}.
@@ -208,7 +215,7 @@ class ChronosEngine:
         for i, (hyp, files) in enumerate(zip(selected, validated)):
             title = str(hyp.get("title") or f"Hypothesis {i + 1}")
             desc = str(hyp.get("description") or "")
-            node, _session = self.spawn_branch(title=title, description=desc)
+            node, _session = self.spawn_branch(title=title, description=desc, owner=owner)
             if files:
                 self.apply_modifications_to_branch(node.id, files)
             res = self.evaluate_branch(node.id)
@@ -245,11 +252,60 @@ class ChronosEngine:
 
     # -- merge / rewind --------------------------------------------------------------------
 
+    def _plan_merge(self, session: IsolationSession) -> list[tuple[Path, str, Optional[str]]]:
+        """
+        Work out, without touching anything, what a merge would write: [(target, new_content, original)].
+
+        Only the files the model supplied (validated up front) are ever merged. Each must still be exactly
+        as it was when the branch was cut (the workspace has not diverged), stay inside the workspace, and
+        not be a symlink.
+        """
+        root = self.workspace_root
+        plan: list[tuple[Path, str, Optional[str]]] = []
+        for rel, new in sorted(session.files.items()):
+            target = root / rel
+            resolved = target.resolve()
+            if resolved != root and root not in resolved.parents:
+                raise MergeError(f"'{rel}' resolves outside the workspace; refusing to merge.")
+            if target.is_symlink():
+                raise MergeError(f"'{rel}' is a symlink in the workspace; refusing to merge through it.")
+            base = self.isolation.read_base_file(session.base_commit, rel)
+            try:
+                current = target.read_bytes().decode("utf-8") if target.exists() else None
+            except (OSError, UnicodeDecodeError) as exc:
+                raise MergeError(f"Cannot read '{rel}' in the workspace as UTF-8 text: {exc}") from exc
+            if current != base:
+                raise MergeError(
+                    f"'{rel}' has changed in the workspace since this branch was created (uncommitted or new "
+                    "commits); refusing to overwrite it. Re-run chronos_branch."
+                )
+            if new != base:
+                plan.append((target, new, current))
+        return plan
+
+    def _rollback(self, written: list[tuple[Path, Optional[str]]]) -> list[str]:
+        """Undo already-written files after a mid-merge failure. Returns descriptions of anything not restored."""
+        failures: list[str] = []
+        for target, original in reversed(written):
+            try:
+                if original is None:
+                    target.unlink(missing_ok=True)  # chronos created this file a moment ago
+                else:
+                    self.file_io.prepare(target)
+                    self.file_io.write(target, original)
+            except (OSError, FileIOError) as exc:
+                failures.append(f"{target}: {exc}")
+        return failures
+
     def merge_branch(self, node_id: str) -> bool:
         """
-        Merge a PASSED branch that still has a live worktree into the workspace via ``git apply``.
-        Refuses (raising) when there is no live session, the branch has not passed, or the patch does
-        not apply; in every refusal the workspace is left exactly as it was.
+        Merge a PASSED branch that still has a live worktree into the workspace.
+
+        The files are written one by one through Hermes' own ``read_file``/``write_file`` tools (so core's
+        write denylist, safe-root and approvals apply), from the validated ``files`` the model supplied,
+        never from a diff recomputed after a test run. If ANY call errors the merge is refused and the
+        files already written are restored. Also refuses when there is no live session, the branch did not
+        pass, or the workspace has diverged from the branch's base.
         """
         node = self.dag.nodes.get(node_id)
         if not node:
@@ -262,8 +318,23 @@ class ChronosEngine:
             )
         if node.status != NodeStatus.PASSED:
             raise MergeError(f"Branch '{node_id}' has status '{node.status.value}'; only passed branches merge.")
+        if self.file_io is None:
+            raise MergeError("No Hermes file-write path is available, so chronos will not write the workspace directly.")
 
-        changed = self.isolation.apply_to_workspace(session)  # raises MergeError, workspace untouched
+        plan = self._plan_merge(session)
+        written: list[tuple[Path, Optional[str]]] = []
+        try:
+            for target, new, original in plan:
+                if original is not None:
+                    self.file_io.prepare(target)
+                self.file_io.write(target, new)
+                written.append((target, original))
+        except FileIOError as exc:
+            leftovers = self._rollback(written)
+            detail = f" Could not restore: {'; '.join(leftovers)}." if leftovers else " Already-written files were restored."
+            raise MergeError(f"Merge refused: {exc}.{detail}") from exc
+
+        changed = bool(plan)
         self.dag.update_node(node_id=node_id, status=NodeStatus.MERGED)
         self.dag.set_active(node_id)
 
@@ -321,9 +392,14 @@ class ChronosEngine:
             "nodes": [n.to_dict() for n in self.dag.nodes.values()],
         }
 
-    def cleanup_sessions(self) -> None:
-        """Remove every live worktree this engine created and persist the DAG."""
-        for session in list(self.active_sessions.values()):
+    def cleanup_sessions(self, owner: Optional[str] = None) -> None:
+        """
+        Remove live worktrees this engine created and persist the DAG. With ``owner`` only that Hermes
+        session's worktrees are removed, so one session ending never deletes another session's branches.
+        """
+        for node_id, session in list(self.active_sessions.items()):
+            if owner is not None and session.owner != owner:
+                continue
             self.isolation.remove_worktree(session)
-        self.active_sessions.clear()
+            del self.active_sessions[node_id]
         self._save_dag()

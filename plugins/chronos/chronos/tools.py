@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 from typing import Any, Callable, Dict, Tuple
 
-from chronos.manager import ChronosManager
+from .manager import ChronosManager
 
 
 def _error(exc: Exception) -> str:
@@ -70,7 +70,11 @@ def get_tool_definitions(manager: ChronosManager) -> dict[str, tuple[dict[str, A
         try:
             engine = manager.engine_for_session(**kw)
             return json.dumps(
-                engine.auto_rollout(hypotheses=hypotheses, auto_merge_best=bool(args.get("auto_merge_best", True))),
+                engine.auto_rollout(
+                    hypotheses=hypotheses,
+                    auto_merge_best=bool(args.get("auto_merge_best", True)),
+                    owner=manager.session_owner(kw),
+                ),
                 indent=2,
             )
         except Exception as exc:

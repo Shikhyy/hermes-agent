@@ -20,6 +20,17 @@ from chronos.engine import ChronosEngine
 VERIFIER = "python3 -m unittest test_auth.py"
 
 
+class DemoFileIO:
+    """DEMO ONLY: inside Hermes, merges write through the agent's read_file/write_file tools so core's
+    write guards apply. This standalone demo works on a throwaway temp repo, so it writes directly."""
+
+    def prepare(self, path):
+        pass
+
+    def write(self, path, content):
+        Path(path).write_text(content, encoding="utf-8")
+
+
 def git(cwd: Path, *args: str) -> None:
     subprocess.run(
         ["git", "-c", "user.name=demo", "-c", "user.email=demo@example.invalid", *args],
@@ -86,6 +97,7 @@ def main():
             workspace_root=workspace,
             config=ChronosConfig(verifier_command=VERIFIER),
             storage_root=Path(tmpdir) / "chronos-state",
+            file_io=DemoFileIO(),
         )
         print(f"🌿 Initial Checkpoint Created: [{engine.dag.active_node_id}]")
 

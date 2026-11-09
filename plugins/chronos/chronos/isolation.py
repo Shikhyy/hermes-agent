@@ -8,8 +8,9 @@ Safety rules enforced here:
     (``<HERMES_HOME>/plugin-data/chronos/<project-hash>/``).
   * Chronos only ever deletes directories it created: each worktree gets a sibling marker file, and
     the storage root carries its own marker. The storage root itself is never removed.
-  * Merging applies a verified patch with ``git apply``; if that is not possible it refuses. There is
-    no "copy the whole tree over the workspace" fallback.
+  * Merging never happens here: the engine writes the validated files through Hermes' own file
+    tools (see ``hermes_io``) so core's write guards apply. There is no whole-tree copy and no raw
+    ``git apply`` onto the user's workspace.
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ from __future__ import annotations
 import re
 import shutil
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
 
@@ -41,8 +42,11 @@ class IsolationSession:
     worktree_path: Path
     base_commit: str
     is_git_worktree: bool = True
-    # The candidate's patch, snapshotted BEFORE the verifier ran (so test by-products never leak into a merge).
-    patch: Optional[str] = None
+    # The validated {relative path: content} the model supplied. A merge writes exactly these files, so
+    # test/build by-products created while verifying can never be merged.
+    files: dict[str, str] = field(default_factory=dict)
+    # Hermes session that created this branch; finalize cleans up only its own worktrees.
+    owner: str = ""
 
 
 class WorkspaceIsolation:
@@ -160,23 +164,24 @@ class WorkspaceIsolation:
         code, out, _ = self._run_git(["diff", "--cached", "--binary", session.base_commit], cwd=session.worktree_path)
         return out + "\n" if code == 0 and out else ""
 
-    def apply_to_workspace(self, session: IsolationSession) -> bool:
-        """
-        Apply the branch's patch to the workspace with ``git apply``.
-
-        Returns False if the branch made no changes. Raises MergeError (workspace untouched) if the
-        patch does not apply cleanly; there is deliberately no file-copy fallback.
-        """
-        diff = session.patch if session.patch is not None else self.compute_diff(session)
-        if not diff:
-            return False
-        code, _, err = self._run_git(["apply", "--check", "--whitespace=nowarn"], stdin=diff)
-        if code != 0:
-            raise MergeError(f"Patch does not apply cleanly to the workspace; nothing was changed. {err}")
-        code, _, err = self._run_git(["apply", "--whitespace=nowarn"], stdin=diff)
-        if code != 0:
-            raise MergeError(f"git apply failed: {err}")
-        return True
+    def read_base_file(self, base_commit: str, rel_path: str) -> Optional[str]:
+        """Exact text of ``rel_path`` at ``base_commit`` (None if the file did not exist there)."""
+        try:
+            proc = subprocess.run(
+                ["git", "show", f"{base_commit}:{rel_path}"],
+                cwd=str(self.workspace_root),
+                capture_output=True,
+                timeout=_GIT_TIMEOUT,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if proc.returncode != 0:
+            return None
+        try:
+            return proc.stdout.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise MergeError(f"'{rel_path}' is not a UTF-8 text file; chronos only merges text files.") from exc
 
     def remove_worktree(self, session: IsolationSession) -> None:
         """Remove one worktree that chronos created."""

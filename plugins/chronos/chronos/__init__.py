@@ -2,12 +2,12 @@
 Chronos: speculative branching for Hermes Agent (isolated worktree rollouts, verification, safe merge).
 """
 
-from chronos.config import ChronosConfig
-from chronos.dag import ChronosDAG, DAGNode, NodeMetrics, NodeStatus
-from chronos.engine import ChronosEngine
-from chronos.isolation import IsolationError, MergeError, WorkspaceIsolation
-from chronos.manager import ChronosManager
-from chronos.verifier import BranchVerifier, VerificationResult
+from .config import ChronosConfig
+from .dag import ChronosDAG, DAGNode, NodeMetrics, NodeStatus
+from .engine import ChronosEngine
+from .isolation import IsolationError, MergeError, WorkspaceIsolation
+from .manager import ChronosManager
+from .verifier import BranchVerifier, VerificationResult
 
 __all__ = [
     "BranchVerifier",

@@ -12,8 +12,8 @@ import json
 import sys
 from pathlib import Path
 
-from chronos.config import ChronosConfig
-from chronos.engine import ChronosEngine
+from .config import ChronosConfig
+from .engine import ChronosEngine
 
 
 def main() -> None:

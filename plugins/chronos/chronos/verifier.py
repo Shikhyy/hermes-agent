@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, List, Optional, Tuple
 
-from chronos.dag import NodeMetrics
+from .dag import NodeMetrics
 
 _OUTPUT_CAP = 20000
 

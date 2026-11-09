@@ -13,9 +13,10 @@ import threading
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
-from chronos.config import ChronosConfig
-from chronos.engine import ChronosEngine
-from chronos.verifier import Runner, subprocess_runner, terminal_runner
+from .config import ChronosConfig
+from .engine import ChronosEngine
+from .hermes_io import HermesFileIO
+from .verifier import Runner, subprocess_runner, terminal_runner
 
 
 class ChronosError(RuntimeError):
@@ -59,7 +60,10 @@ class ChronosManager:
         cwd = self._resolve_cwd()
         if cwd is None:
             return None
-        key = str(cwd)
+        from hermes_constants import get_hermes_home
+
+        # One process serves several profiles; each keeps its own plugin-data, so key by home AND cwd.
+        key = f"{get_hermes_home()}\0{cwd}"
         with self._lock:
             engine = self._engines.get(key)
             if engine is None:
@@ -67,7 +71,10 @@ class ChronosManager:
                 self._engines[key] = engine
         # Fresh operator config and a runner bound to this call's session on every use.
         engine.config = self.load_config()
-        engine.runner = self._runner(**self._dispatch_kwargs(dispatch_kwargs))
+        kw = self._dispatch_kwargs(dispatch_kwargs)
+        engine.runner = self._runner(**kw)
+        # Merges write the workspace only through Hermes' read_file/write_file, bound to this session.
+        engine.file_io = HermesFileIO(self._dispatch_tool, **kw) if self._dispatch_tool is not None else None
         return engine
 
     def engine_for_session(self, **dispatch_kwargs: Any) -> ChronosEngine:
@@ -81,8 +88,16 @@ class ChronosManager:
         """Forward only the session identifiers the terminal tool understands."""
         return {k: v for k, v in kw.items() if k in ("task_id", "session_id") and v}
 
-    def cleanup_all(self) -> None:
+    @staticmethod
+    def session_owner(kw: dict[str, Any]) -> str:
+        """The Hermes session id that owns branches created by this call ('' when unknown)."""
+        return str(kw.get("session_id") or "")
+
+    def cleanup_session(self, session_id: Optional[str]) -> None:
+        """Remove only the worktrees created by ``session_id``. Unknown/empty ids clean nothing."""
+        if not session_id:
+            return
         with self._lock:
             engines = list(self._engines.values())
         for engine in engines:
-            engine.cleanup_sessions()
+            engine.cleanup_sessions(owner=str(session_id))

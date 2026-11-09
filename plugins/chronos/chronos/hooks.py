@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from chronos.manager import ChronosManager
+from .manager import ChronosManager
 
 
 class ChronosHooks:
@@ -26,6 +26,6 @@ class ChronosHooks:
         if len(engine.dag.nodes) == 1 and engine.isolation.get_head_commit():
             engine.checkpoint(title="Session Start Checkpoint", description="Clean state at session start.")
 
-    def on_session_finalize(self, **kwargs: Any) -> None:
-        """Session torn down: remove the worktrees this process created."""
-        self.manager.cleanup_all()
+    def on_session_finalize(self, session_id: Any = None, **kwargs: Any) -> None:
+        """Session torn down: remove only the worktrees THIS session created."""
+        self.manager.cleanup_session(session_id)

@@ -19,16 +19,13 @@ class TestWorkspaceIsolation(unittest.TestCase):
     def tearDown(self):
         self._tmp.cleanup()
 
-    def test_worktree_is_outside_project_and_merge_applies_patch(self):
+    def test_worktree_is_outside_project_and_leaves_workspace_alone(self):
         session = self.iso.create_isolated_worktree("abc123")
         self.assertIn(self.storage.resolve(), session.worktree_path.parents)
         self.assertNotIn(self.workspace.resolve(), session.worktree_path.parents)
 
         (session.worktree_path / "main.py").write_text("print('modified')\n")
         self.assertEqual((self.workspace / "main.py").read_text(), "print('hello')\n")
-
-        self.assertTrue(self.iso.apply_to_workspace(session))
-        self.assertEqual((self.workspace / "main.py").read_text(), "print('modified')\n")
 
         self.iso.remove_worktree(session)
         self.assertFalse(session.worktree_path.exists())
@@ -80,15 +77,15 @@ class TestWorkspaceIsolation(unittest.TestCase):
         self.assertEqual(iso.prune_all(), 0)
         self.assertTrue((other / "branch-x" / "f").exists())
 
-    def test_conflicting_merge_is_refused_and_workspace_unchanged(self):
-        session = self.iso.create_isolated_worktree("abc123")
-        (session.worktree_path / "main.py").write_text("print('from branch')\n")
-        # Workspace diverges after the worktree was cut (uncommitted local edit).
-        (self.workspace / "main.py").write_text("print('my uncommitted work')\n")
+    def test_isolation_has_no_way_to_write_the_workspace(self):
+        # Merging is the engine's job, through Hermes' file tools; isolation must not offer a raw apply.
+        self.assertFalse(hasattr(self.iso, "apply_to_workspace"))
 
-        with self.assertRaises(MergeError):
-            self.iso.apply_to_workspace(session)
-        self.assertEqual((self.workspace / "main.py").read_text(), "print('my uncommitted work')\n")
+    def test_read_base_file_returns_committed_text_exactly(self):
+        (self.workspace / "main.py").write_text("print('dirty')\n")  # uncommitted edit must not leak in
+        session = self.iso.create_isolated_worktree("abc123")
+        self.assertEqual(self.iso.read_base_file(session.base_commit, "main.py"), "print('hello')\n")
+        self.assertIsNone(self.iso.read_base_file(session.base_commit, "does-not-exist.py"))
 
 
 if __name__ == "__main__":

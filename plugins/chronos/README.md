@@ -18,12 +18,12 @@ score them, and merge only a candidate that passes.
 | :--- | :--- |
 | `chronos_branch` | Writes each hypothesis's files into its own worktree, runs verification there, scores the results, and (optionally) merges the best passing one. |
 | `chronos_evaluate` | Re-runs verification for one live branch. |
-| `chronos_merge` | Applies a **passed** branch that still has a live worktree to the workspace as a patch. |
+| `chronos_merge` | Writes the files of a **passed** branch that still has a live worktree into the workspace through Hermes' file tools. |
 | `chronos_rewind` | Checks out the git commit recorded at a checkpoint (refuses if the workspace has uncommitted changes). |
 | `chronos_status` | Shows the decision tree for the current project. |
 
 Hooks: `on_session_start` (prune stale chronos worktrees, record a baseline checkpoint) and
-`on_session_finalize` (remove this process's worktrees). There are no tool-call hooks.
+`on_session_finalize` (remove that session's worktrees). There are no tool-call hooks.
 
 ## Safety model
 
@@ -40,9 +40,15 @@ Hooks: `on_session_start` (prune stale chronos worktrees, record a baseline chec
 * **State lives outside the project:** `<HERMES_HOME>/plugin-data/chronos/<project-hash>/`
   (worktrees and `dag.json`). Chronos only deletes directories it created, identified by marker
   files; the storage root itself is never removed.
-* **Merges are patches, never copies.** A merge runs `git apply --check` first and refuses, leaving
-  the workspace untouched, if there is no live worktree, the branch did not pass, or the patch does
-  not apply cleanly. Uncommitted work is never overwritten.
+* **Merges go through Hermes' write guard.** A merge writes only the files the model supplied (never
+  a diff recomputed after a test run, so test by-products can't slip in), one at a time through
+  Hermes' own `read_file` + `write_file` tools. Core's write denylist, `HERMES_WRITE_SAFE_ROOT` and
+  write approvals therefore apply. If any call is refused the whole merge is refused and files
+  already written are restored. It also refuses if there is no live worktree, the branch did not
+  pass, or a target file changed in the workspace since the branch was created, so uncommitted work
+  is never overwritten. With no tool dispatch available, merges are refused rather than writing directly.
+* **Cleanup is per session.** Finalizing a session removes only the worktrees that session created;
+  engines are keyed by `HERMES_HOME` + working directory, so profiles keep separate plugin-data.
 * **Git is required, and never initialised for you.** Chronos works only in an existing repository
   that has at least one commit.
 * **The workspace is resolved per call** from the calling session's working directory.
